@@ -387,6 +387,65 @@ Reading 1GB CSV |  3.18 |  1.01 |   13.4 | 3.22
 Writing 1GB CSV |  5.64 |  13.0 |   17.0 | 3.24
 
 
+## Source audit (`-csvaudit`)
+
+The optional `-csvaudit file` flag turns on CSV source (provenance)
+auditing. It requires CSV/TSV input and output modes (`-i csv|tsv` and
+`-o csv|tsv`; `-H` and `@"field"` named fields are supported). Normal
+output bytes are unchanged; instead, a machine-readable [JSON Lines]
+side file is written alongside. Every output field of a `print`
+statement with arguments written to standard output gets one JSON
+record listing the de-duplicated input cells the printed value was
+actually computed from.
+
+Each input cell is identified by four values that are independent of
+the script-mutable `NR`, `FNR`, and `FILENAME` variables:
+
+* `reader`: input reader instance id (a new id is assigned per opened
+  input file or stdin),
+* `file`: the file name as opened (`"-"` for stdin),
+* `record`: 1-based logical data record number within the reader
+  (header rows are excluded; a quoted field spanning physical lines is
+  one logical record),
+* `column`: 1-based column number within the logical record.
+
+For an input file `in.csv` containing `a,1` and `b,2`, running
+`goawk -i csv -o csv -csvaudit audit.jsonl '{ sum += $2; print $1, sum }' in.csv`
+prints `a,1` then `b,3` (identical to the run without `-csvaudit`), and
+writes these JSON Lines to `audit.jsonl`:
+
+```
+{"record":1,"field":1,"sources":[{"reader":1,"file":"in.csv","record":1,"column":1}]}
+{"record":1,"field":2,"sources":[{"reader":1,"file":"in.csv","record":1,"column":2}]}
+{"record":2,"field":1,"sources":[{"reader":1,"file":"in.csv","record":2,"column":1}]}
+{"record":2,"field":2,"sources":[{"reader":1,"file":"in.csv","record":1,"column":2},{"reader":1,"file":"in.csv","record":2,"column":2}]}
+```
+
+Constants (literals, `NR`/`FNR`/`FILENAME`, format configuration such as
+`FS`/`OFS`/`CONVFMT`/`OFMT`, and the initial `FIELDS` header names) have
+empty source sets. Plain assignment replaces sources, incremental
+assignment (`+=`, `++`, ...) merges the old sources, operators and
+numeric/string built-in functions merge their actually evaluated
+operands (short-circuited sides are not counted), and re-splitting a
+assigned `$0` makes every resulting field inherit the whole right-hand
+source. Array element values don't absorb index sources, while array
+reads, `in`, `for`-`in` keys, `delete`, and `length(array)` follow the
+index/key lifetimes; `split()`, `sub()`/`gsub()`, and `match()`
+(including `RSTART`/`RLENGTH`) merge their scalar operands.
+
+Because complete provenance can't be produced for them, auditing
+explicitly refuses (with a `source audit:` error) rather than emitting
+incomplete sources for: redirected `print`/`printf` and `getline`,
+command pipes and `system()`, native Go functions, and `rand()`/`srand()`.
+Bare `print` and `printf` don't emit side-file entries; only `print`
+with arguments to standard output does.
+
+The same feature is available to embedded interpreters via
+`interp.Config{SourceAudit: writer}`. With auditing disabled (the
+default), behavior is unchanged.
+
+[JSON Lines]: https://jsonlines.org/
+
 ## Future work
 
 * Consider adding a `printrow(a)` or similar function to make it easier to construct CSV rows from scratch.

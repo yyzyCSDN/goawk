@@ -321,6 +321,25 @@ func (p *interp) newScanner(input io.Reader, buffer []byte) *bufio.Scanner {
 			fields:        &p.fields,
 			setFieldNames: p.setFieldNames,
 		}
+		if p.audit {
+			// Each scanner owns its own logical data record counter, so
+			// quoted fields spanning several physical lines still count
+			// as a single logical record. Identity is captured here from
+			// the actual opened input, never from NR/FNR/FILENAME.
+			recordNum := new(int)
+			readerID := p.provReaderSeq
+			fileName := p.toString(p.filename)
+			splitter.fieldProv = &p.fieldProv
+			splitter.recordNum = recordNum
+			splitter.provLeaf = func(record, column int) *provNode {
+				return p.provLeaf(provRef{
+					reader: readerID,
+					file:   fileName,
+					record: record,
+					column: column,
+				})
+			}
+		}
 		scanner.Split(splitter.scan)
 	case p.recordSep == "\n":
 		// Scanner default is to split on newlines
@@ -347,12 +366,21 @@ func (p *interp) setFieldNames(names []string) {
 	p.fieldIndexes = nil // clear name-to-index cache
 
 	// Populate FIELDS array (mapping of field indexes to field names).
-	fieldsArray := p.array(resolver.Global, p.arrayIndexes["FIELDS"])
+	fieldsArrayIndex := p.arrayIndexes["FIELDS"]
+	fieldsArray := p.array(resolver.Global, fieldsArrayIndex)
 	for k := range fieldsArray {
 		delete(fieldsArray, k)
 	}
 	for i, name := range names {
+		// Header names are configuration: they have no value sources.
 		fieldsArray[strconv.Itoa(i+1)] = str(name)
+	}
+	if p.audit {
+		// Header row is not data: clear FIELDS key sources as well.
+		keyProv := p.arrayKeyProv[fieldsArrayIndex]
+		for k := range keyProv {
+			delete(keyProv, k)
+		}
 	}
 }
 
@@ -490,6 +518,11 @@ type csvSplitter struct {
 	fields        *[]string
 	setFieldNames func(names []string)
 	rowNum        int
+
+	// Source audit hooks (nil unless auditing is enabled).
+	fieldProv *[]*provNode
+	recordNum *int // logical data records emitted by this scanner
+	provLeaf  func(record, column int) *provNode
 }
 
 // The structure of this code is taken from the stdlib encoding/csv Reader
@@ -664,6 +697,15 @@ parseField:
 	// Normal row, set fields and return a line (token).
 	s.rowNum++
 	*s.fields = fields
+	if s.provLeaf != nil {
+		// One logical data record even if quoted fields span lines.
+		*s.recordNum++
+		provs := make([]*provNode, len(fields))
+		for i := range fields {
+			provs[i] = s.provLeaf(*s.recordNum, i+1)
+		}
+		*s.fieldProv = provs
+	}
 	token = origData[skip:advance]
 	token = token[:len(token)-lenNewline(token)]
 	if tokenHasCR {
@@ -787,6 +829,20 @@ func (p *interp) ensureFields() {
 		p.fieldsIsTrueStr = append(p.fieldsIsTrueStr, false)
 	}
 	p.numFields = num(float64(len(p.fields)))
+
+	if p.audit {
+		if len(p.fieldProv) != len(p.fields) {
+			// Fields were re-split from an assigned $0: every resulting
+			// field inherits the whole right-hand source (no byte-level
+			// tracking). Other paths have no per-field sources.
+			p.fieldProv = make([]*provNode, len(p.fields))
+			if p.lineProv != nil {
+				for i := range p.fieldProv {
+					p.fieldProv[i] = p.lineProv
+				}
+			}
+		}
+	}
 }
 
 // Fetch next line (record) of input from current input file, opening
@@ -859,11 +915,20 @@ func (p *interp) nextLine() (string, error) {
 			if p.inputBuffer == nil { // reuse buffer from last input file
 				p.inputBuffer = make([]byte, inputBufSize)
 			}
+			if p.audit {
+				// New input reader instance: identity is independent of
+				// the script-mutable NR/FNR/FILENAME variables.
+				p.provReaderSeq++
+			}
 			p.scanner = p.newScanner(p.input, p.inputBuffer)
 		}
 		p.recordTerminator = p.recordSep // will be overridden if RS is "" or multiple chars
 		if p.scanner.Scan() {
 			// We scanned some input, break and return it
+			if p.audit {
+				// $0 merges the sources of all fields of this logical record.
+				p.lineProv = p.provMergeAll(p.fieldProv)
+			}
 			break
 		}
 		err := p.scanner.Err()
@@ -910,6 +975,11 @@ func (p *interp) closeAll() {
 	}
 	if f, ok := p.errorOutput.(flusher); ok {
 		_ = f.Flush()
+	}
+	if p.audit {
+		if f, ok := p.auditWriter.(flusher); ok {
+			_ = f.Flush()
+		}
 	}
 }
 

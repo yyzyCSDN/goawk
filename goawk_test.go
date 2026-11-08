@@ -1033,3 +1033,59 @@ func convertPathsToFilenames(t *testing.T, str string) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// End-to-end test of the -csvaudit flag: normal output bytes are
+// unchanged and the side file lists de-duplicated input cell sources.
+func TestSourceAuditCLI(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	args := []string{
+		"-i", "csv", "-o", "csv", "-csvaudit", auditPath,
+		`{ sum += $2; print $1, sum }`,
+	}
+	stdout, stderr, err := runGoAWK(args, "a,1\nb,2\n")
+	if err != nil {
+		t.Fatalf("expected no error, got %v (%q)", err, stderr)
+	}
+	if stdout != "a,1\nb,3\n" {
+		t.Fatalf("stdout changed: %q", stdout)
+	}
+
+	data, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("reading audit file: %v", err)
+	}
+	got := string(normalizeNewlines(data))
+	want := strings.Join([]string{
+		`{"record":1,"field":1,"sources":[{"reader":1,"file":"-","record":1,"column":1}]}`,
+		`{"record":1,"field":2,"sources":[{"reader":1,"file":"-","record":1,"column":2}]}`,
+		`{"record":2,"field":1,"sources":[{"reader":1,"file":"-","record":2,"column":1}]}`,
+		`{"record":2,"field":2,"sources":[{"reader":1,"file":"-","record":1,"column":2},{"reader":1,"file":"-","record":2,"column":2}]}`,
+		"",
+	}, "\n")
+	if got != want {
+		t.Fatalf("audit side file: got:\n%s\nwant:\n%s", got, want)
+	}
+
+	// Unsupported operations are refused explicitly at run time.
+	_, stderr, err = runGoAWK([]string{
+		"-i", "csv", "-o", "csv", "-csvaudit", auditPath,
+		`BEGIN { print rand() }`,
+	}, "")
+	if err == nil {
+		t.Fatal("expected refusal error, got none")
+	}
+	if !strings.Contains(stderr, "source audit") || !strings.Contains(stderr, "rand()") {
+		t.Fatalf("unexpected error: %q", stderr)
+	}
+
+	// Enabling audit without CSV/TSV output mode is rejected up front.
+	_, stderr, err = runGoAWK([]string{
+		"-i", "csv", "-csvaudit", auditPath, `{ print $1 }`,
+	}, "a\n")
+	if err == nil {
+		t.Fatal("expected mode validation error, got none")
+	}
+	if !strings.Contains(stderr, "output mode") {
+		t.Fatalf("unexpected error: %q", stderr)
+	}
+}

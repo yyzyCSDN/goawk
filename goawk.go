@@ -75,6 +75,8 @@ GoAWK debugging arguments:
   -covermode mode   set coverage mode: set, count (default "set")
   -coverprofile fn  write coverage profile to file
   -cpuprofile fn    write CPU profile to file
+  -csvaudit fn      write CSV source audit side file to fn (requires -i and
+                    -o to be csv or tsv; see docs/csv.md for details)
   -d                print parsed syntax tree to stdout and exit
   -da               print VM assembly instructions to stdout and exit
   -dt               print variable type information to stdout and exit
@@ -102,6 +104,7 @@ func main() {
 	coverProfile := ""
 	coverAppend := false
 	useChars := false
+	sourceAuditProfile := ""
 	newlineOutput := interp.SmartNewlineMode
 
 	var i int
@@ -165,6 +168,12 @@ argsLoop:
 			}
 			i++
 			cpuProfile = os.Args[i]
+		case "-csvaudit":
+			if i+1 >= len(os.Args) {
+				errorExitf("flag needs an argument: -csvaudit")
+			}
+			i++
+			sourceAuditProfile = os.Args[i]
 		case "-csv", "--csv":
 			inputMode = "csv"
 		case "-c":
@@ -228,6 +237,8 @@ argsLoop:
 				newlineOutput = newlineModeFromString(arg[2:])
 			case strings.HasPrefix(arg, "-cpuprofile="):
 				cpuProfile = arg[len("-cpuprofile="):]
+			case strings.HasPrefix(arg, "-csvaudit="):
+				sourceAuditProfile = arg[len("-csvaudit="):]
 			case strings.HasPrefix(arg, "-memprofile="):
 				memProfile = arg[len("-memprofile="):]
 			case strings.HasPrefix(arg, "-covermode="):
@@ -345,6 +356,16 @@ argsLoop:
 		stdout = os.Stdout
 	}
 
+	// Optional CSV source audit side file.
+	var auditFile *os.File
+	if sourceAuditProfile != "" {
+		auditFile, err = os.Create(sourceAuditProfile)
+		if err != nil {
+			errorExitf("could not create source audit file: %v", err)
+		}
+		defer auditFile.Close()
+	}
+
 	config := &interp.Config{
 		Argv0:         filepath.Base(os.Args[0]),
 		Args:          expandWildcardsOnWindows(args),
@@ -357,6 +378,11 @@ argsLoop:
 			"INPUTMODE", inputMode,
 			"OUTPUTMODE", outputMode,
 		},
+	}
+	// Assign only when non-nil so a nil *os.File doesn't become a
+	// non-nil io.Writer interface and enable auditing implicitly.
+	if auditFile != nil {
+		config.SourceAudit = auditFile
 	}
 	for _, v := range vars {
 		name, value, ok := strings.Cut(v, "=")

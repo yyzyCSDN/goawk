@@ -110,11 +110,21 @@ type interp struct {
 	fileLineNum     value
 	fields          []string
 	fieldsIsTrueStr []bool
+	fieldProv       []*provNode // parallel to fields; provenance of each current field
+	lineProv        *provNode   // provenance of the current $0
 	numFields       value
 	haveFields      bool
 	fieldNames      []string
 	fieldIndexes    map[string]int
 	reparseCSV      bool
+
+	// Optional CSV source audit state (all inert unless audit is true)
+	audit          bool
+	auditWriter    io.Writer
+	auditRecordNum int
+	provReaderSeq  int
+	provLeaves     map[provRef]*provNode
+	arrayKeyProv   []map[string]*provNode // parallel to arrays: per-key index provenance
 
 	// Built-in variables
 	argc             value
@@ -346,6 +356,22 @@ type Config struct {
 	// "getline <file" returns -1 rather than it being a fatal error. Errors
 	// from Create and Append are fatal.
 	FileSystem fs.FS
+
+	// SourceAudit enables optional CSV source (provenance) auditing. When
+	// non-nil, a machine-readable side file is written here: every output
+	// field of a "print" statement with arguments written to standard
+	// output is followed by JSON records listing the de-duplicated input
+	// cells (input reader instance, file, logical data record, and column)
+	// that the printed value was actually computed from. Normal output
+	// bytes are unchanged.
+	//
+	// Auditing is only supported with CSV/TSV input and output modes
+	// (InputMode and OutputMode must be CSVMode or TSVMode). Operations
+	// whose sources can't be tracked (redirected getline or print,
+	// system() and command pipes, native functions, rand() and srand())
+	// return an error instead of producing incomplete provenance. A nil
+	// writer (the default) keeps the normal, unaudited behaviour.
+	SourceAudit io.Writer
 }
 
 // WriteFS is an interface extension for an [fs.FS] assigned to [Config.FileSystem].
@@ -440,6 +466,7 @@ func newInterp(program *parser.Program) *interp {
 	p.globals = make([]value, len(p.scalarIndexes))
 	p.stack = make([]value, initialStackSize)
 	p.arrays = make([]map[string]value, len(p.arrayIndexes), len(p.arrayIndexes)+initialStackSize)
+	p.arrayKeyProv = make([]map[string]*provNode, len(p.arrayIndexes), len(p.arrayIndexes)+initialStackSize)
 	for i := 0; i < len(p.arrayIndexes); i++ {
 		p.arrays[i] = make(map[string]value)
 	}
@@ -551,6 +578,23 @@ func (p *interp) setExecuteConfig(config *Config) error {
 	err = validateCSVOutputConfig(p.outputMode, p.csvOutputConfig)
 	if err != nil {
 		return err
+	}
+
+	// Set up optional source audit. It is restricted to CSV/TSV input
+	// and output modes (Vars above has already applied INPUTMODE and
+	// OUTPUTMODE settings).
+	p.audit = config.SourceAudit != nil
+	if p.audit {
+		if p.inputMode != CSVMode && p.inputMode != TSVMode {
+			return newError("source audit requires CSV/TSV input mode (use -i csv|tsv)")
+		}
+		if p.outputMode != CSVMode && p.outputMode != TSVMode {
+			return newError("source audit requires CSV/TSV output mode (use -o csv|tsv)")
+		}
+		p.auditWriter = config.SourceAudit
+		p.auditRecordNum = 0
+		p.provReaderSeq = 0
+		p.provLeaves = make(map[provRef]*provNode)
 	}
 
 	// Set up ENVIRON from config or environment variables
@@ -843,6 +887,11 @@ func (p *interp) setVarByName(name, value string) error {
 
 // Set special variable by index to given value
 func (p *interp) setSpecial(index int, v value) error {
+	// Built-in special variables (NR, FNR, FILENAME, NF, FS, OFS, ...)
+	// hold runtime state or configuration, not data-cell values, so
+	// they never carry provenance. RSTART/RLENGTH are set directly by
+	// match() to preserve their derived sources.
+	v.prov = nil
 	switch index {
 	case ast.V_NF:
 		numFields := int(v.num())
@@ -857,13 +906,24 @@ func (p *interp) setSpecial(index int, v value) error {
 		if numFields < len(p.fields) {
 			p.fields = p.fields[:numFields]
 			p.fieldsIsTrueStr = p.fieldsIsTrueStr[:numFields]
+			if p.audit {
+				// NF shrink only drops field sources.
+				p.fieldProv = p.fieldProv[:numFields]
+			}
 		}
 		for i := len(p.fields); i < numFields; i++ {
 			p.fields = append(p.fields, "")
 			p.fieldsIsTrueStr = append(p.fieldsIsTrueStr, false)
+			if p.audit {
+				// NF grow adds fields with empty provenance.
+				p.fieldProv = append(p.fieldProv, nil)
+			}
 		}
 		p.line = p.joinFields(p.fields)
 		p.lineIsTrueStr = true
+		if p.audit {
+			p.lineProv = p.provMergeAll(p.fieldProv)
+		}
 	case ast.V_NR:
 		p.lineNum = v
 	case ast.V_RLENGTH:
@@ -937,6 +997,9 @@ func (p *interp) setSpecial(index int, v value) error {
 		if err != nil {
 			return err
 		}
+		if p.audit && p.inputMode != CSVMode && p.inputMode != TSVMode {
+			return newError("source audit requires CSV/TSV input mode (use -i csv|tsv)")
+		}
 	case ast.V_OUTPUTMODE:
 		var err error
 		p.outputMode, p.csvOutputConfig, err = parseOutputMode(p.toString(v))
@@ -946,6 +1009,9 @@ func (p *interp) setSpecial(index int, v value) error {
 		err = validateCSVOutputConfig(p.outputMode, p.csvOutputConfig)
 		if err != nil {
 			return err
+		}
+		if p.audit && p.outputMode != CSVMode && p.outputMode != TSVMode {
+			return newError("source audit requires CSV/TSV output mode (use -o csv|tsv)")
 		}
 	default:
 		panic(fmt.Sprintf("unexpected special variable index: %d", index))
@@ -983,11 +1049,15 @@ func (p *interp) setArrayValue(scope resolver.Scope, arrayIndex int, index strin
 // Get the value of given numbered field, equivalent to "$index"
 func (p *interp) getField(index int) value {
 	if index == 0 {
+		var v value
 		if p.lineIsTrueStr {
-			return str(p.line)
+			v = str(p.line)
 		} else {
-			return numStr(p.line)
+			v = numStr(p.line)
 		}
+		// $0 merges the sources of all fields of the current record.
+		v.prov = p.lineProv
+		return v
 	}
 	p.ensureFields()
 	if index < 1 {
@@ -999,11 +1069,16 @@ func (p *interp) getField(index int) value {
 	if index > len(p.fields) {
 		return str("")
 	}
+	var v value
 	if p.fieldsIsTrueStr[index-1] {
-		return str(p.fields[index-1])
+		v = str(p.fields[index-1])
 	} else {
-		return numStr(p.fields[index-1])
+		v = numStr(p.fields[index-1])
 	}
+	if p.audit && index <= len(p.fieldProv) {
+		v.prov = p.fieldProv[index-1]
+	}
+	return v
 }
 
 // Get the value of a field by name (for CSV/TSV mode), as in @"name".
@@ -1027,8 +1102,22 @@ func (p *interp) getFieldByName(name string) (value, error) {
 
 // Sets a single field, equivalent to "$index = value"
 func (p *interp) setField(index int, value string) error {
+	return p.setFieldProv(index, value, nil)
+}
+
+// setFieldProv is like setField, but also assigns the provenance of the
+// right-hand value. Writing $0 replaces the whole record's provenance;
+// fields re-split from that $0 inherit that entire source. Writing a
+// single field rebuilds $0 from the retained field sources.
+func (p *interp) setFieldProv(index int, value string, prov *provNode) error {
 	if index == 0 {
 		p.setLine(value, true)
+		if p.audit {
+			p.lineProv = prov
+			// Re-split happens lazily in ensureFields, which inherits
+			// the whole right-hand source for each new field.
+			p.fieldProv = nil
+		}
 		return nil
 	}
 	if index > maxFieldIndex {
@@ -1045,9 +1134,21 @@ func (p *interp) setField(index int, value string) error {
 	for i := len(p.fields); i < index; i++ {
 		p.fields = append(p.fields, "")
 		p.fieldsIsTrueStr = append(p.fieldsIsTrueStr, true)
+		if p.audit {
+			// Intermediate filler fields have empty provenance.
+			p.fieldProv = append(p.fieldProv, nil)
+		}
 	}
 	p.fields[index-1] = value
 	p.fieldsIsTrueStr[index-1] = true
+	if p.audit {
+		for len(p.fieldProv) < len(p.fields) {
+			p.fieldProv = append(p.fieldProv, nil)
+		}
+		p.fieldProv[index-1] = prov
+		// Field write-back rebuilds $0 from the retained field sources.
+		p.lineProv = p.provMergeAll(p.fieldProv)
+	}
 	p.numFields = num(float64(len(p.fields)))
 	p.line = p.joinFields(p.fields)
 	p.lineIsTrueStr = true

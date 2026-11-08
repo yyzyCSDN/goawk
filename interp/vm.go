@@ -113,38 +113,46 @@ func (p *interp) execute(code []compiler.Opcode) error {
 		case compiler.ArrayGlobal:
 			arrayIndex := code[ip]
 			ip++
-			array := p.arrays[arrayIndex]
-			index := p.toString(p.peekTop())
-			v := arrayGet(array, index)
+			v := p.arrayReadProv(int(arrayIndex), p.peekTop())
 			p.replaceTop(v)
 
 		case compiler.ArrayLocal:
 			arrayIndex := code[ip]
 			ip++
-			array := p.localArray(int(arrayIndex))
-			index := p.toString(p.peekTop())
-			v := arrayGet(array, index)
+			slot := p.arrayIndex(resolver.Local, int(arrayIndex))
+			v := p.arrayReadProv(slot, p.peekTop())
 			p.replaceTop(v)
 
 		case compiler.InGlobal:
 			arrayIndex := code[ip]
 			ip++
-			array := p.arrays[arrayIndex]
-			index := p.toString(p.peekTop())
-			_, ok := array[index]
-			p.replaceTop(boolean(ok))
+			indexVal := p.peekTop()
+			index := p.toString(indexVal)
+			_, ok := p.arrays[arrayIndex][index]
+			result := boolean(ok)
+			if p.audit {
+				// "in" merges the current index sources with the
+				// queried key's lifetime sources.
+				result.prov = p.provMerge(indexVal.prov, p.arrayKeyProv[arrayIndex][index])
+			}
+			p.replaceTop(result)
 
 		case compiler.InLocal:
 			arrayIndex := code[ip]
 			ip++
-			array := p.localArray(int(arrayIndex))
-			index := p.toString(p.peekTop())
-			_, ok := array[index]
-			p.replaceTop(boolean(ok))
+			slot := p.arrayIndex(resolver.Local, int(arrayIndex))
+			indexVal := p.peekTop()
+			index := p.toString(indexVal)
+			_, ok := p.arrays[slot][index]
+			result := boolean(ok)
+			if p.audit {
+				result.prov = p.provMerge(indexVal.prov, p.arrayKeyProv[slot][index])
+			}
+			p.replaceTop(result)
 
 		case compiler.AssignField:
 			right, index := p.popTwo()
-			err := p.setField(int(index.num()), p.toString(right))
+			err := p.setFieldProv(int(index.num()), p.toString(right), right.prov)
 			if err != nil {
 				return err
 			}
@@ -155,7 +163,7 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			right, index := p.popTwo()
 			n := p.peekTop()
 			if n.num() > 0 {
-				err := p.setField(int(index.num()), p.toString(right))
+				err := p.setFieldProv(int(index.num()), p.toString(right), right.prov)
 				if err != nil {
 					return err
 				}
@@ -182,40 +190,38 @@ func (p *interp) execute(code []compiler.Opcode) error {
 		case compiler.AssignArrayGlobal:
 			arrayIndex := code[ip]
 			ip++
-			array := p.arrays[arrayIndex]
 			v, index := p.popTwo()
-			array[p.toString(index)] = v
+			p.arrayWriteProv(int(arrayIndex), index, v)
 
 		case compiler.AssignArrayLocal:
 			arrayIndex := code[ip]
 			ip++
-			array := p.localArray(int(arrayIndex))
+			slot := p.arrayIndex(resolver.Local, int(arrayIndex))
 			v, index := p.popTwo()
-			array[p.toString(index)] = v
+			p.arrayWriteProv(slot, index, v)
 
 		case compiler.Delete:
 			arrayScope := code[ip]
 			arrayIndex := code[ip+1]
 			ip += 2
-			array := p.array(resolver.Scope(arrayScope), int(arrayIndex))
+			slot := p.arrayIndex(resolver.Scope(arrayScope), int(arrayIndex))
 			index := p.toString(p.pop())
-			delete(array, index)
+			p.arrayDeleteProv(slot, index)
 
 		case compiler.DeleteAll:
 			arrayScope := code[ip]
 			arrayIndex := code[ip+1]
 			ip += 2
-			array := p.array(resolver.Scope(arrayScope), int(arrayIndex))
-			for k := range array {
-				delete(array, k)
-			}
+			slot := p.arrayIndex(resolver.Scope(arrayScope), int(arrayIndex))
+			p.arrayDeleteAllProv(slot)
 
 		case compiler.IncrField:
 			amount := code[ip]
 			ip++
 			index := int(p.pop().num())
 			v := p.getField(index)
-			err := p.setField(index, p.toString(num(v.num()+float64(amount))))
+			// Constant increment: retain the field's existing sources.
+			err := p.setFieldProv(index, p.toString(num(v.num()+float64(amount))), v.prov)
 			if err != nil {
 				return err
 			}
@@ -224,13 +230,15 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			amount := code[ip]
 			index := code[ip+1]
 			ip += 2
-			p.globals[index] = num(p.globals[index].num() + float64(amount))
+			old := p.globals[index]
+			p.globals[index] = withProv(num(old.num()+float64(amount)), old.prov)
 
 		case compiler.IncrLocal:
 			amount := code[ip]
 			index := code[ip+1]
 			ip += 2
-			p.frame[index] = num(p.frame[index].num() + float64(amount))
+			old := p.frame[index]
+			p.frame[index] = withProv(num(old.num()+float64(amount)), old.prov)
 
 		case compiler.IncrSpecial:
 			amount := code[ip]
@@ -246,17 +254,23 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			amount := code[ip]
 			arrayIndex := code[ip+1]
 			ip += 2
-			array := p.arrays[arrayIndex]
-			index := p.toString(p.pop())
-			array[index] = num(array[index].num() + float64(amount))
+			indexVal := p.pop()
+			index := p.toString(indexVal)
+			old := p.arrays[arrayIndex][index]
+			// Constant increment: retain the element's existing sources.
+			v := withProv(num(old.num()+float64(amount)), old.prov)
+			p.arrayWriteProv(int(arrayIndex), indexVal, v)
 
 		case compiler.IncrArrayLocal:
 			amount := code[ip]
 			arrayIndex := code[ip+1]
 			ip += 2
-			array := p.localArray(int(arrayIndex))
-			index := p.toString(p.pop())
-			array[index] = num(array[index].num() + float64(amount))
+			slot := p.arrayIndex(resolver.Local, int(arrayIndex))
+			indexVal := p.pop()
+			index := p.toString(indexVal)
+			old := p.arrays[slot][index]
+			v := withProv(num(old.num()+float64(amount)), old.prov)
+			p.arrayWriteProv(slot, indexVal, v)
 
 		case compiler.AugAssignField:
 			operation := compiler.AugOp(code[ip])
@@ -268,7 +282,7 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			if err != nil {
 				return err
 			}
-			err = p.setField(index, p.toString(v))
+			err = p.setFieldProv(index, p.toString(v), v.prov)
 			if err != nil {
 				return err
 			}
@@ -310,33 +324,36 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			operation := compiler.AugOp(code[ip])
 			arrayIndex := code[ip+1]
 			ip += 2
-			array := p.arrays[arrayIndex]
-			index := p.toString(p.pop())
-			v, err := p.augAssignOp(operation, array[index], p.pop())
+			indexVal := p.pop()
+			index := p.toString(indexVal)
+			v, err := p.augAssignOp(operation, p.arrays[arrayIndex][index], p.pop())
 			if err != nil {
 				return err
 			}
-			array[index] = v
+			p.arrayWriteProv(int(arrayIndex), indexVal, v)
 
 		case compiler.AugAssignArrayLocal:
 			operation := compiler.AugOp(code[ip])
 			arrayIndex := code[ip+1]
 			ip += 2
-			array := p.localArray(int(arrayIndex))
+			slot := p.arrayIndex(resolver.Local, int(arrayIndex))
 			right, indexVal := p.popTwo()
 			index := p.toString(indexVal)
-			v, err := p.augAssignOp(operation, array[index], right)
+			v, err := p.augAssignOp(operation, p.arrays[slot][index], right)
 			if err != nil {
 				return err
 			}
-			array[index] = v
+			p.arrayWriteProv(slot, indexVal, v)
 
 		case compiler.Regex:
 			// Stand-alone /regex/ is equivalent to: $0 ~ /regex/
 			index := code[ip]
 			ip++
 			re := p.regexes[index]
-			p.push(boolean(re.MatchString(p.line)))
+			result := boolean(re.MatchString(p.line))
+			// Implicit $0 is the actual evaluated operand.
+			result.prov = p.lineProv
+			p.push(result)
 
 		case compiler.IndexMulti:
 			numValues := int(code[ip])
@@ -346,19 +363,20 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			for _, v := range values {
 				indices = append(indices, p.toString(v))
 			}
-			p.push(str(strings.Join(indices, p.subscriptSep)))
+			// The joined index carries the merged sources of its parts.
+			p.push(withProv(str(strings.Join(indices, p.subscriptSep)), p.provMergeValues(values...)))
 
 		case compiler.Add:
 			l, r := p.peekPop()
-			p.replaceTop(num(l.num() + r.num()))
+			p.replaceTop(withProv(num(l.num()+r.num()), p.provMerge(l.prov, r.prov)))
 
 		case compiler.Subtract:
 			l, r := p.peekPop()
-			p.replaceTop(num(l.num() - r.num()))
+			p.replaceTop(withProv(num(l.num()-r.num()), p.provMerge(l.prov, r.prov)))
 
 		case compiler.Multiply:
 			l, r := p.peekPop()
-			p.replaceTop(num(l.num() * r.num()))
+			p.replaceTop(withProv(num(l.num()*r.num()), p.provMerge(l.prov, r.prov)))
 
 		case compiler.Divide:
 			l, r := p.peekPop()
@@ -366,11 +384,11 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			if rf == 0.0 {
 				return newError("division by zero")
 			}
-			p.replaceTop(num(l.num() / rf))
+			p.replaceTop(withProv(num(l.num()/rf), p.provMerge(l.prov, r.prov)))
 
 		case compiler.Power:
 			l, r := p.peekPop()
-			p.replaceTop(num(math.Pow(l.num(), r.num())))
+			p.replaceTop(withProv(num(math.Pow(l.num(), r.num())), p.provMerge(l.prov, r.prov)))
 
 		case compiler.Modulo:
 			l, r := p.peekPop()
@@ -378,71 +396,83 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			if rf == 0.0 {
 				return newError("division by zero in mod")
 			}
-			p.replaceTop(num(math.Mod(l.num(), rf)))
+			p.replaceTop(withProv(num(math.Mod(l.num(), rf)), p.provMerge(l.prov, r.prov)))
 
 		case compiler.Equals:
 			l, r := p.peekPop()
 			ln, lIsStr := l.isTrueStr()
 			rn, rIsStr := r.isTrueStr()
+			var b bool
 			if lIsStr || rIsStr {
-				p.replaceTop(boolean(p.toString(l) == p.toString(r)))
+				b = p.toString(l) == p.toString(r)
 			} else {
-				p.replaceTop(boolean(ln == rn))
+				b = ln == rn
 			}
+			p.replaceTop(withProv(boolean(b), p.provMerge(l.prov, r.prov)))
 
 		case compiler.NotEquals:
 			l, r := p.peekPop()
 			ln, lIsStr := l.isTrueStr()
 			rn, rIsStr := r.isTrueStr()
+			var b bool
 			if lIsStr || rIsStr {
-				p.replaceTop(boolean(p.toString(l) != p.toString(r)))
+				b = p.toString(l) != p.toString(r)
 			} else {
-				p.replaceTop(boolean(ln != rn))
+				b = ln != rn
 			}
+			p.replaceTop(withProv(boolean(b), p.provMerge(l.prov, r.prov)))
 
 		case compiler.Less:
 			l, r := p.peekPop()
 			ln, lIsStr := l.isTrueStr()
 			rn, rIsStr := r.isTrueStr()
+			var b bool
 			if lIsStr || rIsStr {
-				p.replaceTop(boolean(p.toString(l) < p.toString(r)))
+				b = p.toString(l) < p.toString(r)
 			} else {
-				p.replaceTop(boolean(ln < rn))
+				b = ln < rn
 			}
+			p.replaceTop(withProv(boolean(b), p.provMerge(l.prov, r.prov)))
 
 		case compiler.Greater:
 			l, r := p.peekPop()
 			ln, lIsStr := l.isTrueStr()
 			rn, rIsStr := r.isTrueStr()
+			var b bool
 			if lIsStr || rIsStr {
-				p.replaceTop(boolean(p.toString(l) > p.toString(r)))
+				b = p.toString(l) > p.toString(r)
 			} else {
-				p.replaceTop(boolean(ln > rn))
+				b = ln > rn
 			}
+			p.replaceTop(withProv(boolean(b), p.provMerge(l.prov, r.prov)))
 
 		case compiler.LessOrEqual:
 			l, r := p.peekPop()
 			ln, lIsStr := l.isTrueStr()
 			rn, rIsStr := r.isTrueStr()
+			var b bool
 			if lIsStr || rIsStr {
-				p.replaceTop(boolean(p.toString(l) <= p.toString(r)))
+				b = p.toString(l) <= p.toString(r)
 			} else {
-				p.replaceTop(boolean(ln <= rn))
+				b = ln <= rn
 			}
+			p.replaceTop(withProv(boolean(b), p.provMerge(l.prov, r.prov)))
 
 		case compiler.GreaterOrEqual:
 			l, r := p.peekPop()
 			ln, lIsStr := l.isTrueStr()
 			rn, rIsStr := r.isTrueStr()
+			var b bool
 			if lIsStr || rIsStr {
-				p.replaceTop(boolean(p.toString(l) >= p.toString(r)))
+				b = p.toString(l) >= p.toString(r)
 			} else {
-				p.replaceTop(boolean(ln >= rn))
+				b = ln >= rn
 			}
+			p.replaceTop(withProv(boolean(b), p.provMerge(l.prov, r.prov)))
 
 		case compiler.Concat:
 			l, r := p.peekPop()
-			p.replaceTop(str(p.toString(l) + p.toString(r)))
+			p.replaceTop(withProv(str(p.toString(l)+p.toString(r)), p.provMerge(l.prov, r.prov)))
 
 		case compiler.ConcatMulti:
 			numValues := int(code[ip])
@@ -453,7 +483,7 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			for _, v := range values {
 				sb.WriteString(p.toString(v))
 			}
-			p.push(str(sb.String()))
+			p.push(withProv(str(sb.String()), p.provMergeValues(values...)))
 
 		case compiler.Match:
 			l, r := p.peekPop()
@@ -462,7 +492,7 @@ func (p *interp) execute(code []compiler.Opcode) error {
 				return err
 			}
 			matched := re.MatchString(p.toString(l))
-			p.replaceTop(boolean(matched))
+			p.replaceTop(withProv(boolean(matched), p.provMerge(l.prov, r.prov)))
 
 		case compiler.NotMatch:
 			l, r := p.peekPop()
@@ -471,19 +501,23 @@ func (p *interp) execute(code []compiler.Opcode) error {
 				return err
 			}
 			matched := re.MatchString(p.toString(l))
-			p.replaceTop(boolean(!matched))
+			p.replaceTop(withProv(boolean(!matched), p.provMerge(l.prov, r.prov)))
 
 		case compiler.Not:
-			p.replaceTop(boolean(!p.peekTop().boolean()))
+			v := p.peekTop()
+			p.replaceTop(withProv(boolean(!v.boolean()), v.prov))
 
 		case compiler.UnaryMinus:
-			p.replaceTop(num(-p.peekTop().num()))
+			v := p.peekTop()
+			p.replaceTop(withProv(num(-v.num()), v.prov))
 
 		case compiler.UnaryPlus:
-			p.replaceTop(num(p.peekTop().num()))
+			v := p.peekTop()
+			p.replaceTop(withProv(num(v.num()), v.prov))
 
 		case compiler.Boolean:
-			p.replaceTop(boolean(p.peekTop().boolean()))
+			v := p.peekTop()
+			p.replaceTop(withProv(boolean(v.boolean()), v.prov))
 
 		case compiler.Jump:
 			offset := code[ip]
@@ -622,16 +656,23 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			arrayIndex := code[ip+3]
 			offset := code[ip+4]
 			ip += 5
-			array := p.array(resolver.Scope(arrayScope), int(arrayIndex))
+			slot := p.arrayIndex(resolver.Scope(arrayScope), int(arrayIndex))
+			array := p.arrays[slot]
 			loopCode := code[ip : ip+int(offset)]
 			for index := range array {
+				// The loop key gets the union of sources from which the
+				// key was created or written during its lifetime.
+				keyValue := str(index)
+				if p.audit {
+					keyValue.prov = p.arrayKeyProv[slot][index]
+				}
 				switch resolver.Scope(varScope) {
 				case resolver.Global:
-					p.globals[varIndex] = str(index)
+					p.globals[varIndex] = keyValue
 				case resolver.Local:
-					p.frame[varIndex] = str(index)
+					p.frame[varIndex] = keyValue
 				default: // resolver.Special
-					err := p.setSpecial(int(varIndex), str(index))
+					err := p.setSpecial(int(varIndex), keyValue)
 					if err != nil {
 						return err
 					}
@@ -661,19 +702,20 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			arrayScope := code[ip]
 			arrayIndex := code[ip+1]
 			ip += 2
-			array := p.array(resolver.Scope(arrayScope), int(arrayIndex))
-			p.push(num(float64(len(array))))
+			slot := p.arrayIndex(resolver.Scope(arrayScope), int(arrayIndex))
+			// Array length merges the sources of the surviving keys.
+			p.push(withProv(num(float64(len(p.arrays[slot]))), p.arrayKeyProvUnion(slot)))
 
 		case compiler.CallSplit:
 			arrayScope := code[ip]
 			arrayIndex := code[ip+1]
 			ip += 2
-			s := p.toString(p.peekTop())
-			n, err := p.split(s, resolver.Scope(arrayScope), int(arrayIndex), p.fieldSep, false, p.inputMode)
+			s := p.peekTop()
+			n, err := p.split(p.toString(s), resolver.Scope(arrayScope), int(arrayIndex), p.fieldSep, false, p.inputMode, s.prov)
 			if err != nil {
 				return err
 			}
-			p.replaceTop(num(float64(n)))
+			p.replaceTop(withProv(num(float64(n)), s.prov))
 
 		case compiler.CallSplitSep:
 			arrayScope := code[ip]
@@ -681,12 +723,14 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			sepIsRegex := code[ip+2] != 0
 			ip += 3
 			s, fieldSep := p.peekPop()
-			// 3-argument form of split() ignores input mode
-			n, err := p.split(p.toString(s), resolver.Scope(arrayScope), int(arrayIndex), p.toString(fieldSep), sepIsRegex, DefaultMode)
+			// 3-argument form of split() ignores input mode. Each result
+			// (and the count) merges the scalar arguments' sources.
+			prov := p.provMerge(s.prov, fieldSep.prov)
+			n, err := p.split(p.toString(s), resolver.Scope(arrayScope), int(arrayIndex), p.toString(fieldSep), sepIsRegex, DefaultMode, prov)
 			if err != nil {
 				return err
 			}
-			p.replaceTop(num(float64(n)))
+			p.replaceTop(withProv(num(float64(n)), prov))
 
 		case compiler.CallSprintf:
 			numArgs := code[ip]
@@ -696,7 +740,8 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			if err != nil {
 				return err
 			}
-			p.push(str(s))
+			// sprintf merges the actual evaluated format and arguments.
+			p.push(withProv(str(s), p.provMergeValues(args...)))
 
 		case compiler.CallUser:
 			funcIndex := code[ip]
@@ -724,6 +769,7 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			for j := numArrayArgs; j < f.NumArrays; j++ {
 				arrays = append(arrays, len(p.arrays))
 				p.arrays = append(p.arrays, make(map[string]value))
+				p.arrayKeyProv = append(p.arrayKeyProv, nil)
 			}
 			p.localArrays = append(p.localArrays, arrays)
 
@@ -737,6 +783,7 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			p.frame = oldFrame
 			p.localArrays = p.localArrays[:len(p.localArrays)-1]
 			p.arrays = p.arrays[:oldArraysLen]
+			p.arrayKeyProv = p.arrayKeyProv[:oldArraysLen]
 
 			if r, ok := err.(returnValue); ok {
 				p.push(r.Value)
@@ -747,6 +794,9 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			}
 
 		case compiler.CallNative:
+			if p.audit {
+				return errAuditUnsupported("native function calls")
+			}
 			funcIndex := int(code[ip])
 			numArgs := int(code[ip+1])
 			ip += 2
@@ -777,6 +827,10 @@ func (p *interp) execute(code []compiler.Opcode) error {
 
 			args := p.popSlice(int(numArgs))
 
+			if p.audit && redirect != lexer.ILLEGAL {
+				return errAuditUnsupported("redirected print")
+			}
+
 			// Determine what output stream to write to.
 			output := p.output
 			if redirect != lexer.ILLEGAL {
@@ -793,6 +847,14 @@ func (p *interp) execute(code []compiler.Opcode) error {
 				if err != nil {
 					return err
 				}
+				// "print" with arguments to standard output: append the
+				// de-duplicated sources of each output field to the side
+				// file. The normal output bytes above are never changed.
+				if p.audit && redirect == lexer.ILLEGAL {
+					if err := p.auditEmit(args); err != nil {
+						return err
+					}
+				}
 			} else {
 				// "print" with no arguments prints the raw value of $0,
 				// regardless of output mode.
@@ -806,6 +868,10 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			numArgs := code[ip]
 			redirect := lexer.Token(code[ip+1])
 			ip += 2
+
+			if p.audit && redirect != lexer.ILLEGAL {
+				return errAuditUnsupported("redirected printf")
+			}
 
 			args := p.popSlice(int(numArgs))
 			s, err := p.sprintf(p.toString(args[0]), args[1:])
@@ -835,6 +901,7 @@ func (p *interp) execute(code []compiler.Opcode) error {
 				return err
 			}
 			if ret == 1 {
+				// nextLine already assigned the new record's sources.
 				p.setLine(line, false)
 			}
 			p.push(num(ret))
@@ -848,7 +915,7 @@ func (p *interp) execute(code []compiler.Opcode) error {
 				return err
 			}
 			if ret == 1 {
-				err := p.setField(0, line)
+				err := p.setFieldProv(0, line, p.lineProv)
 				if err != nil {
 					return err
 				}
@@ -865,7 +932,8 @@ func (p *interp) execute(code []compiler.Opcode) error {
 				return err
 			}
 			if ret == 1 {
-				p.globals[index] = numStr(line)
+				// The saved value belongs to the record just read.
+				p.globals[index] = withProv(numStr(line), p.lineProv)
 			}
 			p.push(num(ret))
 
@@ -879,7 +947,7 @@ func (p *interp) execute(code []compiler.Opcode) error {
 				return err
 			}
 			if ret == 1 {
-				p.frame[index] = numStr(line)
+				p.frame[index] = withProv(numStr(line), p.lineProv)
 			}
 			p.push(num(ret))
 
@@ -910,10 +978,10 @@ func (p *interp) execute(code []compiler.Opcode) error {
 			if err != nil {
 				return err
 			}
-			index := p.toString(p.peekTop())
+			indexVal := p.peekTop()
 			if ret == 1 {
-				array := p.array(resolver.Scope(arrayScope), int(arrayIndex))
-				array[index] = numStr(line)
+				slot := p.arrayIndex(resolver.Scope(arrayScope), int(arrayIndex))
+				p.arrayWriteProv(slot, indexVal, withProv(numStr(line), p.lineProv))
 			}
 			p.replaceTop(num(ret))
 		}
@@ -926,7 +994,8 @@ func (p *interp) callBuiltin(builtinOp compiler.BuiltinOp) error {
 	switch builtinOp {
 	case compiler.BuiltinAtan2:
 		y, x := p.peekPop()
-		p.replaceTop(num(math.Atan2(y.num(), x.num())))
+		// Numeric builtins merge the actual evaluated operands' sources.
+		p.replaceTop(withProv(num(math.Atan2(y.num(), x.num())), p.provMerge(y.prov, x.prov)))
 
 	case compiler.BuiltinClose:
 		var err error
@@ -950,10 +1019,12 @@ func (p *interp) callBuiltin(builtinOp compiler.BuiltinOp) error {
 		p.replaceTop(num(float64(code)))
 
 	case compiler.BuiltinCos:
-		p.replaceTop(num(math.Cos(p.peekTop().num())))
+		v := p.peekTop()
+		p.replaceTop(withProv(num(math.Cos(v.num())), v.prov))
 
 	case compiler.BuiltinExp:
-		p.replaceTop(num(math.Exp(p.peekTop().num())))
+		v := p.peekTop()
+		p.replaceTop(withProv(num(math.Exp(v.num())), v.prov))
 
 	case compiler.BuiltinFflush:
 		name := p.toString(p.peekTop())
@@ -985,7 +1056,10 @@ func (p *interp) callBuiltin(builtinOp compiler.BuiltinOp) error {
 		if err != nil {
 			return err
 		}
-		p.replaceTwo(num(float64(n)), str(out))
+		// Write-back target and count merge all actual operands,
+		// including an implicit $0 pushed by the compiler.
+		prov := p.provMergeValues(regex, repl, in)
+		p.replaceTwo(withProv(num(float64(n)), prov), withProv(str(out), prov))
 
 	case compiler.BuiltinIndex:
 		sValue, substr := p.peekPop()
@@ -999,10 +1073,11 @@ func (p *interp) callBuiltin(builtinOp compiler.BuiltinOp) error {
 		} else {
 			awkIndex = index + 1
 		}
-		p.replaceTop(num(float64(awkIndex)))
+		p.replaceTop(withProv(num(float64(awkIndex)), p.provMerge(sValue.prov, substr.prov)))
 
 	case compiler.BuiltinInt:
-		p.replaceTop(num(float64(int64(p.peekTop().num()))))
+		v := p.peekTop()
+		p.replaceTop(withProv(num(float64(int64(v.num()))), v.prov))
 
 	case compiler.BuiltinLength:
 		var length int
@@ -1011,20 +1086,23 @@ func (p *interp) callBuiltin(builtinOp compiler.BuiltinOp) error {
 		} else {
 			length = len(p.line)
 		}
-		p.push(num(float64(length)))
+		// No-argument length() measures the implicit $0.
+		p.push(withProv(num(float64(length)), p.lineProv))
 
 	case compiler.BuiltinLengthArg:
-		s := p.toString(p.peekTop())
+		v := p.peekTop()
+		s := p.toString(v)
 		var length int
 		if p.chars {
 			length = utf8.RuneCountInString(s)
 		} else {
 			length = len(s)
 		}
-		p.replaceTop(num(float64(length)))
+		p.replaceTop(withProv(num(float64(length)), v.prov))
 
 	case compiler.BuiltinLog:
-		p.replaceTop(num(math.Log(p.peekTop().num())))
+		v := p.peekTop()
+		p.replaceTop(withProv(num(math.Log(v.num())), v.prov))
 
 	case compiler.BuiltinMatch:
 		sValue, regex := p.peekPop()
@@ -1033,35 +1111,48 @@ func (p *interp) callBuiltin(builtinOp compiler.BuiltinOp) error {
 		if err != nil {
 			return err
 		}
+		// RSTART/RLENGTH are derived from the actual operands.
+		prov := p.provMerge(sValue.prov, regex.prov)
 		loc := re.FindStringIndex(s)
 		if loc == nil {
-			p.matchStart = num(0)
-			p.matchLength = num(-1)
+			p.matchStart = withProv(num(0), prov)
+			p.matchLength = withProv(num(-1), prov)
 		} else if p.chars {
-			p.matchStart = num(float64(utf8.RuneCountInString(s[:loc[0]]) + 1))
-			p.matchLength = num(float64(utf8.RuneCountInString(s[loc[0]:loc[1]])))
+			p.matchStart = withProv(num(float64(utf8.RuneCountInString(s[:loc[0]])+1)), prov)
+			p.matchLength = withProv(num(float64(utf8.RuneCountInString(s[loc[0]:loc[1]]))), prov)
 		} else {
-			p.matchStart = num(float64(loc[0] + 1))
-			p.matchLength = num(float64(loc[1] - loc[0]))
+			p.matchStart = withProv(num(float64(loc[0]+1)), prov)
+			p.matchLength = withProv(num(float64(loc[1]-loc[0])), prov)
 		}
 		p.replaceTop(p.matchStart)
 
 	case compiler.BuiltinRand:
+		if p.audit {
+			return errAuditUnsupported("rand()")
+		}
 		p.push(num(p.random.Float64()))
 
 	case compiler.BuiltinSin:
-		p.replaceTop(num(math.Sin(p.peekTop().num())))
+		v := p.peekTop()
+		p.replaceTop(withProv(num(math.Sin(v.num())), v.prov))
 
 	case compiler.BuiltinSqrt:
-		p.replaceTop(num(math.Sqrt(p.peekTop().num())))
+		v := p.peekTop()
+		p.replaceTop(withProv(num(math.Sqrt(v.num())), v.prov))
 
 	case compiler.BuiltinSrand:
+		if p.audit {
+			return errAuditUnsupported("srand()")
+		}
 		prevSeed := p.randSeed
 		p.randSeed = float64(time.Now().Unix())
 		p.random.Seed(int64(math.Float64bits(p.randSeed)))
 		p.push(num(prevSeed))
 
 	case compiler.BuiltinSrandSeed:
+		if p.audit {
+			return errAuditUnsupported("srand()")
+		}
 		prevSeed := p.randSeed
 		p.randSeed = p.peekTop().num()
 		p.random.Seed(int64(math.Float64bits(p.randSeed)))
@@ -1073,7 +1164,8 @@ func (p *interp) callBuiltin(builtinOp compiler.BuiltinOp) error {
 		if err != nil {
 			return err
 		}
-		p.replaceTwo(num(float64(n)), str(out))
+		prov := p.provMergeValues(regex, repl, in)
+		p.replaceTwo(withProv(num(float64(n)), prov), withProv(str(out), prov))
 
 	case compiler.BuiltinSubstr:
 		sValue, posValue := p.peekPop()
@@ -1092,13 +1184,14 @@ func (p *interp) callBuiltin(builtinOp compiler.BuiltinOp) error {
 			length := len(s) - pos + 1
 			substr = s[pos-1 : pos-1+length]
 		}
-		p.replaceTop(str(substr))
+		p.replaceTop(withProv(str(substr), p.provMerge(sValue.prov, posValue.prov)))
 
 	case compiler.BuiltinSubstrLength:
 		posValue, lengthValue := p.popTwo()
 		length := int(lengthValue.num())
 		pos := int(posValue.num())
-		s := p.toString(p.peekTop())
+		sValue := p.peekTop()
+		s := p.toString(sValue)
 		var substr string
 		if p.chars {
 			substr = substrLengthChars(s, pos, length)
@@ -1118,9 +1211,13 @@ func (p *interp) callBuiltin(builtinOp compiler.BuiltinOp) error {
 			}
 			substr = s[pos-1 : pos-1+length]
 		}
-		p.replaceTop(str(substr))
+		p.replaceTop(withProv(str(substr),
+			p.provMerge(p.provMerge(sValue.prov, posValue.prov), lengthValue.prov)))
 
 	case compiler.BuiltinSystem:
+		if p.audit {
+			return errAuditUnsupported("system()")
+		}
 		if p.noExec {
 			return newError("can't call system() due to NoExec")
 		}
@@ -1147,25 +1244,15 @@ func (p *interp) callBuiltin(builtinOp compiler.BuiltinOp) error {
 		p.replaceTop(num(float64(exitCode)))
 
 	case compiler.BuiltinTolower:
-		p.replaceTop(str(strings.ToLower(p.toString(p.peekTop()))))
+		v := p.peekTop()
+		p.replaceTop(withProv(str(strings.ToLower(p.toString(v))), v.prov))
 
 	case compiler.BuiltinToupper:
-		p.replaceTop(str(strings.ToUpper(p.toString(p.peekTop()))))
+		v := p.peekTop()
+		p.replaceTop(withProv(str(strings.ToUpper(p.toString(v))), v.prov))
 	}
 
 	return nil
-}
-
-// Fetch the value at the given index from array. This handles the strange
-// POSIX behavior of creating a null entry for non-existent array elements.
-// Per the POSIX spec, "Any other reference to a nonexistent array element
-// [apart from "in" expressions] shall automatically create it."
-func arrayGet(array map[string]value, index string) value {
-	v, ok := array[index]
-	if !ok {
-		array[index] = v
-	}
-	return v
 }
 
 // Stack operations follow. These should be inlined. Instead of just push and
@@ -1246,6 +1333,9 @@ func (p *interp) peekSlice(n int) []value {
 func (p *interp) getline(redirect lexer.Token) (float64, string, error) {
 	switch redirect {
 	case lexer.PIPE: // redirect from command
+		if p.audit {
+			return 0, "", errAuditUnsupported("getline from a command")
+		}
 		name := p.toString(p.pop())
 		scanner, err := p.getInputScannerPipe(name)
 		if err != nil {
@@ -1260,6 +1350,9 @@ func (p *interp) getline(redirect lexer.Token) (float64, string, error) {
 		return 1, scanner.Text(), nil
 
 	case lexer.LESS: // redirect from file
+		if p.audit {
+			return 0, "", errAuditUnsupported("redirected getline")
+		}
 		name := p.toString(p.pop())
 		scanner, err := p.getInputScannerFile(name)
 		if err != nil {
@@ -1295,26 +1388,29 @@ func (p *interp) getline(redirect lexer.Token) (float64, string, error) {
 
 // Perform augmented assignment operation.
 func (p *interp) augAssignOp(op compiler.AugOp, l, r value) (value, error) {
+	// Incremental assignment merges the old value's sources with the
+	// right-hand operand's sources.
+	prov := p.provMerge(l.prov, r.prov)
 	switch op {
 	case compiler.AugOpAdd:
-		return num(l.num() + r.num()), nil
+		return withProv(num(l.num()+r.num()), prov), nil
 	case compiler.AugOpSub:
-		return num(l.num() - r.num()), nil
+		return withProv(num(l.num()-r.num()), prov), nil
 	case compiler.AugOpMul:
-		return num(l.num() * r.num()), nil
+		return withProv(num(l.num()*r.num()), prov), nil
 	case compiler.AugOpDiv:
 		rf := r.num()
 		if rf == 0.0 {
 			return null(), newError("division by zero")
 		}
-		return num(l.num() / rf), nil
+		return withProv(num(l.num()/rf), prov), nil
 	case compiler.AugOpPow:
-		return num(math.Pow(l.num(), r.num())), nil
+		return withProv(num(math.Pow(l.num(), r.num())), prov), nil
 	default: // AugOpMod
 		rf := r.num()
 		if rf == 0.0 {
 			return null(), newError("division by zero in mod")
 		}
-		return num(math.Mod(l.num(), rf)), nil
+		return withProv(num(math.Mod(l.num(), rf)), prov), nil
 	}
 }

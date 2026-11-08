@@ -251,8 +251,11 @@ func validNativeType(typ reflect.Type) bool {
 	}
 }
 
-// Guts of the split() function
-func (p *interp) split(s string, scope resolver.Scope, index int, sep string, sepIsRegex bool, mode IOMode) (int, error) {
+// Guts of the split() function. prov is the merged provenance of the
+// scalar arguments (the source string and, if given, the separator);
+// every result element inherits it, while the constant index keys have
+// no sources.
+func (p *interp) split(s string, scope resolver.Scope, index int, sep string, sepIsRegex bool, mode IOMode, prov *provNode) (int, error) {
 	var parts []string
 	switch {
 	case mode == CSVMode || mode == TSVMode:
@@ -288,9 +291,15 @@ func (p *interp) split(s string, scope resolver.Scope, index int, sep string, se
 	}
 	array := make(map[string]value, len(parts))
 	for i, part := range parts {
-		array[strconv.Itoa(i+1)] = numStr(part)
+		array[strconv.Itoa(i+1)] = withProv(numStr(part), prov)
 	}
-	p.arrays[p.arrayIndex(scope, index)] = array
+	slot := p.arrayIndex(scope, index)
+	p.arrays[slot] = array
+	if p.audit {
+		// split() replaces the whole array; constant index keys carry
+		// no index sources.
+		p.arrayKeyProv[slot] = nil
+	}
 	return len(array), nil
 }
 

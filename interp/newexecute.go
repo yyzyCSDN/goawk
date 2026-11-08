@@ -108,12 +108,23 @@ func (p *interp) resetCore() {
 	p.fileLineNum = num(0)
 	p.fields = nil
 	p.fieldsIsTrueStr = nil
+	p.fieldProv = nil
+	p.lineProv = nil
 	p.numFields = num(0)
 	p.haveFields = false
 
 	p.matchStart = num(0)
 	p.matchLength = num(0)
 	p.argc = num(0)
+
+	// Clear per-key provenance of global arrays (array contents are
+	// cleared separately in resetVars; local slots are re-created per call).
+	for i, keyProv := range p.arrayKeyProv {
+		for k := range keyProv {
+			delete(keyProv, k)
+		}
+		p.arrayKeyProv[i] = keyProv
+	}
 
 	p.exitStatus = 0
 }

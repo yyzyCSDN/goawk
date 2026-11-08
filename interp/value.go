@@ -23,6 +23,10 @@ type value struct {
 	typ valueType // Type of value
 	s   string    // String value (for typeStr and typeNumStr)
 	n   float64   // Numeric value (for typeNum)
+
+	// Provenance of the actual value: nil unless CSV source audit is
+	// enabled. Constants and unauditable values always have a nil set.
+	prov *provNode
 }
 
 // Create a new null value
